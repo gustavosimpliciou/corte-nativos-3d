@@ -1,0 +1,636 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Nativos 3D Cutter API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: projects
+    description: Project management
+  - name: models
+    description: 3D model management
+  - name: operations
+    description: Cut and mesh operations
+  - name: exports
+    description: Model export operations
+  - name: stats
+    description: Dashboard statistics
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /projects:
+    get:
+      operationId: listProjects
+      tags: [projects]
+      summary: List all projects
+      responses:
+        "200":
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Project"
+    post:
+      operationId: createProject
+      tags: [projects]
+      summary: Create a new project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectInput"
+      responses:
+        "201":
+          description: Created project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+
+  /projects/{id}:
+    get:
+      operationId: getProject
+      tags: [projects]
+      summary: Get project by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectDetail"
+        "404":
+          description: Not found
+    patch:
+      operationId: updateProject
+      tags: [projects]
+      summary: Update a project
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectUpdate"
+      responses:
+        "200":
+          description: Updated project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+    delete:
+      operationId: deleteProject
+      tags: [projects]
+      summary: Delete a project
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /models:
+    get:
+      operationId: listModels
+      tags: [models]
+      summary: List models, optionally filtered by project
+      parameters:
+        - name: projectId
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of models
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Model"
+    post:
+      operationId: createModel
+      tags: [models]
+      summary: Register a model (metadata only, file already processed client-side)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModelInput"
+      responses:
+        "201":
+          description: Created model
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Model"
+
+  /models/{id}:
+    get:
+      operationId: getModel
+      tags: [models]
+      summary: Get model by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Model
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Model"
+        "404":
+          description: Not found
+    delete:
+      operationId: deleteModel
+      tags: [models]
+      summary: Delete a model
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /operations:
+    get:
+      operationId: listOperations
+      tags: [operations]
+      summary: List operations for a model
+      parameters:
+        - name: modelId
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: projectId
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of operations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Operation"
+    post:
+      operationId: createOperation
+      tags: [operations]
+      summary: Create a new cut operation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OperationInput"
+      responses:
+        "201":
+          description: Created operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+
+  /operations/{id}:
+    get:
+      operationId: getOperation
+      tags: [operations]
+      summary: Get operation by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "404":
+          description: Not found
+    patch:
+      operationId: updateOperation
+      tags: [operations]
+      summary: Update operation status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OperationUpdate"
+      responses:
+        "200":
+          description: Updated operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+    delete:
+      operationId: deleteOperation
+      tags: [operations]
+      summary: Delete an operation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /exports:
+    get:
+      operationId: listExports
+      tags: [exports]
+      summary: List exports for an operation or project
+      parameters:
+        - name: operationId
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: projectId
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of exports
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Export"
+    post:
+      operationId: createExport
+      tags: [exports]
+      summary: Record an export
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExportInput"
+      responses:
+        "201":
+          description: Recorded export
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Export"
+
+  /stats/dashboard:
+    get:
+      operationId: getDashboardStats
+      tags: [stats]
+      summary: Get dashboard summary stats
+      responses:
+        "200":
+          description: Dashboard stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardStats"
+
+  /stats/recent-activity:
+    get:
+      operationId: getRecentActivity
+      tags: [stats]
+      summary: Get recent activity feed
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 10
+      responses:
+        "200":
+          description: Recent activity items
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ActivityItem"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    Project:
+      type: object
+      required: [id, name, createdAt, updatedAt, modelCount, operationCount]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        description:
+          type: ["string", "null"]
+        thumbnail:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        modelCount:
+          type: integer
+        operationCount:
+          type: integer
+
+    ProjectDetail:
+      type: object
+      required: [id, name, createdAt, updatedAt, models, operations]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        description:
+          type: ["string", "null"]
+        thumbnail:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/Model"
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Operation"
+
+    ProjectInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+        thumbnail:
+          type: string
+
+    ProjectUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+        thumbnail:
+          type: string
+
+    Model:
+      type: object
+      required: [id, projectId, filename, format, faceCount, vertexCount, createdAt]
+      properties:
+        id:
+          type: integer
+        projectId:
+          type: integer
+        filename:
+          type: string
+        format:
+          type: string
+          enum: [stl, obj, ply, "3mf"]
+        faceCount:
+          type: integer
+        vertexCount:
+          type: integer
+        fileSizeBytes:
+          type: ["integer", "null"]
+        volumeMm3:
+          type: ["number", "null"]
+        boundingBoxMm:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+
+    ModelInput:
+      type: object
+      required: [projectId, filename, format, faceCount, vertexCount]
+      properties:
+        projectId:
+          type: integer
+        filename:
+          type: string
+        format:
+          type: string
+          enum: [stl, obj, ply, "3mf"]
+        faceCount:
+          type: integer
+        vertexCount:
+          type: integer
+        fileSizeBytes:
+          type: integer
+        volumeMm3:
+          type: number
+        boundingBoxMm:
+          type: string
+
+    Operation:
+      type: object
+      required: [id, modelId, projectId, type, status, createdAt]
+      properties:
+        id:
+          type: integer
+        modelId:
+          type: integer
+        projectId:
+          type: integer
+        type:
+          type: string
+          enum: [cut, selection, repair, export]
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        faceCount:
+          type: ["integer", "null"]
+        durationMs:
+          type: ["integer", "null"]
+        notes:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+        completedAt:
+          type: ["string", "null"]
+
+    OperationInput:
+      type: object
+      required: [modelId, projectId, type]
+      properties:
+        modelId:
+          type: integer
+        projectId:
+          type: integer
+        type:
+          type: string
+          enum: [cut, selection, repair, export]
+        faceCount:
+          type: integer
+        notes:
+          type: string
+
+    OperationUpdate:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        durationMs:
+          type: integer
+        notes:
+          type: string
+        completedAt:
+          type: string
+
+    Export:
+      type: object
+      required: [id, operationId, projectId, format, filename, createdAt]
+      properties:
+        id:
+          type: integer
+        operationId:
+          type: integer
+        projectId:
+          type: integer
+        format:
+          type: string
+          enum: [stl_binary, stl_ascii, obj, ply, "3mf"]
+        filename:
+          type: string
+        fileSizeBytes:
+          type: ["integer", "null"]
+        createdAt:
+          type: string
+
+    ExportInput:
+      type: object
+      required: [operationId, projectId, format, filename]
+      properties:
+        operationId:
+          type: integer
+        projectId:
+          type: integer
+        format:
+          type: string
+          enum: [stl_binary, stl_ascii, obj, ply, "3mf"]
+        filename:
+          type: string
+        fileSizeBytes:
+          type: integer
+
+    DashboardStats:
+      type: object
+      required: [totalProjects, totalModels, totalOperations, totalExports, totalFacesCut, recentProjectCount]
+      properties:
+        totalProjects:
+          type: integer
+        totalModels:
+          type: integer
+        totalOperations:
+          type: integer
+        totalExports:
+          type: integer
+        totalFacesCut:
+          type: integer
+        recentProjectCount:
+          type: integer
+        operationsByStatus:
+          type: object
+          additionalProperties:
+            type: integer
+        exportsByFormat:
+          type: object
+          additionalProperties:
+            type: integer
+
+    ActivityItem:
+      type: object
+      required: [id, type, description, createdAt]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [project_created, model_imported, cut_completed, export_completed]
+        description:
+          type: string
+        projectId:
+          type: ["integer", "null"]
+        projectName:
+          type: ["string", "null"]
+        createdAt:
+          type: string

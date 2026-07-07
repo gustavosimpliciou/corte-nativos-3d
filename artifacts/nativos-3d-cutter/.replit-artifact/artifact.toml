@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "Nativos 3D Cutter"
+version = "1.0.0"
+id = "artifacts/nativos-3d-cutter"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 18299
+
+[services.development]
+run = "pnpm --filter @workspace/nativos-3d-cutter run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/nativos-3d-cutter", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/nativos-3d-cutter/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "18299"
+BASE_PATH = "/"

@@ -15,7 +15,7 @@ export default function NativosCut() {
 
   return (
     <main
-      className="flex flex-col h-screen w-screen overflow-hidden select-none"
+      className="flex flex-col h-dvh w-screen overflow-hidden select-none"
       style={{ background: 'oklch(0.08 0 0)' }}
     >
       {/* Barra superior */}

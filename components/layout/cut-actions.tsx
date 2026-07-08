@@ -81,6 +81,7 @@ export function CutActions() {
         roughness: 0.5,
         metalness: 0.15,
         side: THREE.DoubleSide,
+        flatShading: false,
       })
 
       const cutMesh = new THREE.Mesh(subGeo, mat)

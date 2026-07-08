@@ -64,21 +64,25 @@ export function PlaneCutPanel() {
         return
       }
 
-      // Metade positiva → vira o modelo principal (mesmo material cinza).
-      const mainMesh = new THREE.Mesh(positive, modelMesh.material)
+      // Metade positiva → vira o modelo principal.
+      // Clona o material para não afetar a peça original e garante DoubleSide
+      // (a tampa pode ter normal sutil invertida dependendo da geometria).
+      const mainMat = (modelMesh.material as THREE.MeshStandardMaterial).clone()
+      mainMat.side = THREE.DoubleSide
+      mainMat.needsUpdate = true
+      const mainMesh = new THREE.Mesh(positive, mainMat)
       mainMesh.position.copy(modelMesh.position)
       mainMesh.rotation.copy(modelMesh.rotation)
       mainMesh.scale.copy(modelMesh.scale)
 
       // Metade negativa → peça separada (laranja), afastada para visualização.
-      // Mesmo material sólido do modelo: FrontSide + flatShading para a peça
-      // parecer maciça (a tampa de corte é fechada, então não há vazamento).
+      // DoubleSide garante que a tampa apareça mesmo se a normal estiver invertida.
       const partMat = new THREE.MeshStandardMaterial({
         color: new THREE.Color('#ff6600'),
         roughness: 0.6,
         metalness: 0.1,
-        side: THREE.FrontSide,
-        flatShading: true,
+        side: THREE.DoubleSide,
+        flatShading: false,
       })
       const partMesh = new THREE.Mesh(negative, partMat)
       partMesh.position.copy(modelMesh.position)

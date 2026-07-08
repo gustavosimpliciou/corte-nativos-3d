@@ -528,12 +528,13 @@ export function computeSmoothNormalsByPosition(geometry: THREE.BufferGeometry): 
 /**
  * Gera triângulos que fecham o contorno aberto de um conjunto de faces.
  *
- * Uma aresta é de borda quando aparece numa só direção dentro do conjunto
- * (o reverso não existe). Ligando essas arestas formamos os laços de contorno
- * do corte, que são triangulados em leque a partir do centróide — preenchendo
- * a seção transversal para a peça parecer maciça.
- *
- * Retorna "sopa de triângulos" (posições + normais, sem índice).
+ * Algoritmo robusto:
+ *  1. Quantiza vértices e solda duplicados (STL binário tem verts duplicados).
+ *  2. Encontra arestas de borda: aresta presente em só uma direção.
+ *  3. Monta loops fechados via chain-following com um nextPtr por nó.
+ *  4. Calcula a normal do plano de cada loop via PCA (Newell's method).
+ *  5. Projeta para 2D e triangula com THREE.ShapeUtils.triangulateShape.
+ *  6. Emite os triângulos com a normal correta para a tampa.
  */
 export function buildCap(
   geometry: THREE.BufferGeometry,
@@ -542,93 +543,152 @@ export function buildCap(
   const posAttr = geometry.getAttribute('position') as THREE.BufferAttribute
   const idxAttr = geometry.index
   const faces = Array.isArray(faceSet) ? faceSet : Array.from(faceSet)
+  if (faces.length === 0) return { pos: new Float32Array(0), nrm: new Float32Array(0) }
 
+  // ── 1. Quantização e soldagem de vértices ──────────────────────────────────
   const Q = 1e4
-  const key = (v: number) =>
-    `${Math.round(posAttr.getX(v) * Q)},${Math.round(posAttr.getY(v) * Q)},${Math.round(posAttr.getZ(v) * Q)}`
-
   const keyToId = new Map<string, number>()
-  const idPos: number[] = []
-  const vId = (v: number) => {
-    const k = key(v)
+  const idPx: number[] = [] // posição x,y,z por ID
+
+  const vId = (v: number): number => {
+    const k = `${Math.round(posAttr.getX(v) * Q)},${Math.round(posAttr.getY(v) * Q)},${Math.round(posAttr.getZ(v) * Q)}`
     let id = keyToId.get(k)
     if (id === undefined) {
-      id = keyToId.size
+      id = idPx.length / 3
       keyToId.set(k, id)
-      idPos.push(posAttr.getX(v), posAttr.getY(v), posAttr.getZ(v))
+      idPx.push(posAttr.getX(v), posAttr.getY(v), posAttr.getZ(v))
     }
     return id
   }
 
-  // Conta arestas direcionadas dentro do conjunto
-  const dirEdges = new Set<number>()          // codifica x*BIG + y
-  const BIG = 1e7
-  const enc = (x: number, y: number) => x * BIG + y
+  // ── 2. Arestas direcionadas — borda = aresta sem reverso ───────────────────
+  // Usa string-key para evitar colisão numérica com modelos grandes
+  const dirEdgeSet = new Set<string>()
+  const facesIds: Array<[number, number, number]> = []
 
-  const facesEnc: Array<[number, number, number]> = []
   for (const f of faces) {
     const a = vId(idxAttr ? idxAttr.getX(f * 3)     : f * 3)
     const b = vId(idxAttr ? idxAttr.getX(f * 3 + 1) : f * 3 + 1)
     const c = vId(idxAttr ? idxAttr.getX(f * 3 + 2) : f * 3 + 2)
-    facesEnc.push([a, b, c])
-    dirEdges.add(enc(a, b))
-    dirEdges.add(enc(b, c))
-    dirEdges.add(enc(c, a))
+    facesIds.push([a, b, c])
+    dirEdgeSet.add(`${a}>${b}`)
+    dirEdgeSet.add(`${b}>${c}`)
+    dirEdgeSet.add(`${c}>${a}`)
   }
 
-  // Aresta de borda: direção presente cujo reverso não existe.
-  // Para a tampa, invertemos a direção (next: y → x).
-  const next = new Map<number, number>()
-  let boundaryCount = 0
-  for (const [a, b, c] of facesEnc) {
-    const edges: [number, number][] = [[a, b], [b, c], [c, a]]
-    for (const [x, y] of edges) {
-      if (!dirEdges.has(enc(y, x))) {
-        next.set(y, x)
-        boundaryCount++
+  // Grafo direcionado de arestas de borda: para cada nó, lista de saídas
+  const outEdges = new Map<number, number[]>()
+  for (const [a, b, c] of facesIds) {
+    for (const [x, y] of [[a, b], [b, c], [c, a]] as [number, number][]) {
+      // Aresta de borda: x→y existe mas y→x não existe
+      if (!dirEdgeSet.has(`${y}>${x}`)) {
+        // Tampa: percorremos y→x (inverso) para orientar a face "para fora"
+        let list = outEdges.get(y)
+        if (!list) { list = []; outEdges.set(y, list) }
+        if (!list.includes(x)) list.push(x)
       }
     }
   }
 
-  if (boundaryCount === 0) return { pos: new Float32Array(0), nrm: new Float32Array(0) }
+  if (outEdges.size === 0) return { pos: new Float32Array(0), nrm: new Float32Array(0) }
 
-  // Percorre os laços de contorno e tria­ngula em leque
+  // ── 3. Chain-following: extrai loops fechados ──────────────────────────────
+  const nextPtr = new Map<number, number>()
+  interface RawLoop { ids: number[] }
+  const rawLoops: RawLoop[] = []
+
+  for (const [startNode] of outEdges) {
+    while (true) {
+      const ptr = nextPtr.get(startNode) ?? 0
+      const outs = outEdges.get(startNode)
+      if (!outs || ptr >= outs.length) break
+
+      const chain: number[] = []
+      let cur = startNode
+      const maxSteps = idPx.length / 3 + 4
+      let steps = 0
+      let closed = false
+
+      while (steps++ < maxSteps) {
+        const cPtr = nextPtr.get(cur) ?? 0
+        const cOuts = outEdges.get(cur)
+        if (!cOuts || cPtr >= cOuts.length) break
+        chain.push(cur)
+        const next = cOuts[cPtr]
+        nextPtr.set(cur, cPtr + 1)
+        if (next === startNode) { closed = true; break }
+        cur = next
+      }
+
+      if (closed && chain.length >= 3) rawLoops.push({ ids: chain })
+    }
+  }
+
+  if (rawLoops.length === 0) return { pos: new Float32Array(0), nrm: new Float32Array(0) }
+
+  // ── 4-6. Triangula cada loop com ShapeUtils ────────────────────────────────
   const capPos: number[] = []
   const capNrm: number[] = []
-  const visited = new Set<number>()
 
-  for (const startVertex of next.keys()) {
-    if (visited.has(startVertex)) continue
-    const loop: number[] = []
-    let cur: number | undefined = startVertex
-    let guard = 0
-    while (cur !== undefined && !visited.has(cur) && guard++ < boundaryCount + 5) {
-      visited.add(cur)
-      loop.push(cur)
-      cur = next.get(cur)
-      if (cur === startVertex) break
+  for (const { ids } of rawLoops) {
+    const pts3d = ids.map(id => new THREE.Vector3(idPx[id * 3], idPx[id * 3 + 1], idPx[id * 3 + 2]))
+
+    // Normal do plano via Newell's method (robusta para qualquer polígono)
+    const loopN = new THREE.Vector3()
+    const n = pts3d.length
+    for (let i = 0; i < n; i++) {
+      const cur = pts3d[i]
+      const nxt = pts3d[(i + 1) % n]
+      loopN.x += (cur.y - nxt.y) * (cur.z + nxt.z)
+      loopN.y += (cur.z - nxt.z) * (cur.x + nxt.x)
+      loopN.z += (cur.x - nxt.x) * (cur.y + nxt.y)
     }
-    if (loop.length < 3) continue
+    if (loopN.lengthSq() < 1e-20) continue
+    loopN.normalize()
 
-    // Centróide do laço
-    let cx = 0, cy = 0, cz = 0
-    for (const id of loop) { cx += idPos[id * 3]; cy += idPos[id * 3 + 1]; cz += idPos[id * 3 + 2] }
-    cx /= loop.length; cy /= loop.length; cz /= loop.length
+    // Base ortonormal no plano
+    const refUp = Math.abs(loopN.y) < 0.9
+      ? new THREE.Vector3(0, 1, 0)
+      : new THREE.Vector3(1, 0, 0)
+    const uAxis = new THREE.Vector3().crossVectors(refUp, loopN).normalize()
+    const vAxis = new THREE.Vector3().crossVectors(loopN, uAxis).normalize()
 
-    for (let i = 0; i < loop.length; i++) {
-      const id0 = loop[i]
-      const id1 = loop[(i + 1) % loop.length]
-      const bx = idPos[id0 * 3], by = idPos[id0 * 3 + 1], bz = idPos[id0 * 3 + 2]
-      const dx = idPos[id1 * 3], dy = idPos[id1 * 3 + 1], dz = idPos[id1 * 3 + 2]
+    // Projeção 2D
+    const origin = pts3d[0]
+    const pts2d = pts3d.map(p => {
+      const rel = p.clone().sub(origin)
+      return new THREE.Vector2(rel.dot(uAxis), rel.dot(vAxis))
+    })
 
-      let nx = (by - cy) * (dz - cz) - (bz - cz) * (dy - cy)
-      let ny = (bz - cz) * (dx - cx) - (bx - cx) * (dz - cz)
-      let nz = (bx - cx) * (dy - cy) - (by - cy) * (dx - cx)
-      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1
-      nx /= len; ny /= len; nz /= len
+    // Garante winding CCW para ShapeUtils (área > 0)
+    let area = 0
+    for (let i = 0; i < pts2d.length; i++) {
+      const a = pts2d[i], b = pts2d[(i + 1) % pts2d.length]
+      area += a.x * b.y - b.x * a.y
+    }
+    if (area < 0) {
+      pts2d.reverse()
+      pts3d.reverse()
+    }
 
-      capPos.push(cx, cy, cz, bx, by, bz, dx, dy, dz)
-      capNrm.push(nx, ny, nz, nx, ny, nz, nx, ny, nz)
+    let faces: number[][]
+    try {
+      faces = THREE.ShapeUtils.triangulateShape(pts2d, [])
+    } catch {
+      // Fallback: fan triangulation a partir do centróide
+      faces = []
+      for (let i = 1; i + 1 < pts2d.length; i++) faces.push([0, i, i + 1])
+    }
+
+    for (const tri of faces) {
+      const A = pts3d[tri[0]], B = pts3d[tri[1]], C = pts3d[tri[2]]
+      if (!A || !B || !C) continue
+      capPos.push(A.x, A.y, A.z, B.x, B.y, B.z, C.x, C.y, C.z)
+      capNrm.push(
+        loopN.x, loopN.y, loopN.z,
+        loopN.x, loopN.y, loopN.z,
+        loopN.x, loopN.y, loopN.z,
+      )
     }
   }
 
@@ -700,7 +760,8 @@ export function removeSubMesh(
   geo.setAttribute('position', new THREE.Float32BufferAttribute(newPos, 3))
   geo.setAttribute('normal', new THREE.Float32BufferAttribute(newNormal, 3))
   if (newUV) geo.setAttribute('uv', new THREE.Float32BufferAttribute(newUV, 2))
-  if (!normalAttr) geo.computeVertexNormals()
+  // Sempre recalcula normais para garantir consistência com a nova tampa
+  geo.computeVertexNormals()
   geo.computeBoundingBox()
   geo.computeBoundingSphere()
   return geo

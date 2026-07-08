@@ -1,36 +1,26 @@
 /**
  * Solid Plane Cut — Corte de sólido por plano (watertight manifold)
  * ------------------------------------------------------------------
- * Ao contrário de um simples "surface split" (que só divide a casca e deixa
- * buracos), este algoritmo trata a malha como um SÓLIDO FECHADO e produz DUAS
- * peças volumétricas independentes, cada uma fechada com uma tampa triangulada
- * exatamente sobre o plano de corte — exatamente como Blender (Bisect + Fill),
- * Meshmixer, Bambu Studio, PrusaSlicer e Cura.
- *
- * Pipeline:
- *   1. Classifica cada vértice em relação ao plano (positivo / negativo / sobre).
- *   2. Divide (clip) cada triângulo interceptado, gerando vértices de interseção.
- *   3. Detecta o segmento de interseção de cada triângulo que cruza o plano.
- *   4. Reconstrói os segmentos em loops de aresta fechados (closed edge loops).
- *   5. Triangula os loops (com detecção de furos/concavidade) → tampas.
- *   6. Corrige as normais das tampas (para fora de cada metade).
- *   7. Exporta duas BufferGeometry fechadas, prontas para o fatiador preencher.
+ * Implementa o pipeline completo descrito na especificação técnica:
+ *   1. Calcular a interseção do plano com todos os triângulos.
+ *   2. Gerar segmentos de interseção (directed half-edges).
+ *   3. Organizar os segmentos em loops fechados (chain following).
+ *   4. Triangular o contorno (Ear Clipping via THREE.ShapeUtils).
+ *   5. Criar as faces do CAP com winding correto para cada metade.
+ *   6. Soldar vértices duplicados (quantized snapping).
+ *   7. Recalcular normais.
+ *   8. Garantir que a malha seja watertight.
  */
 
 import * as THREE from 'three'
 
 export interface PlaneCutResult {
-  /** Metade no lado +normal do plano (sólida e fechada). */
   positive: THREE.BufferGeometry
-  /** Metade no lado -normal do plano (sólida e fechada). */
   negative: THREE.BufferGeometry
-  /** Número de loops de contorno fechados usados para gerar as tampas. */
   capLoops: number
-  /** Triângulos de tampa gerados no total (positivo + negativo). */
   capTriangles: number
 }
 
-// Vértice com posição + normal interpoláveis ao longo das arestas cortadas.
 interface Vtx {
   p: THREE.Vector3
   n: THREE.Vector3
@@ -38,10 +28,6 @@ interface Vtx {
 
 export type PlaneAxis = 'x' | 'y' | 'z'
 
-/**
- * Deriva a normal e o ponto do plano a partir de um eixo do mundo e um offset
- * normalizado (0..1) dentro da bounding box da geometria.
- */
 export function planeFromAxisOffset(
   bbox: THREE.Box3,
   axis: PlaneAxis,
@@ -66,7 +52,9 @@ export function planeFromAxisOffset(
   return { normal, point }
 }
 
-// Acumulador de sopa de triângulos (posição + normal) para uma metade.
+// ---------------------------------------------------------------------------
+// Acumulador de triângulos para cada metade do corte
+// ---------------------------------------------------------------------------
 class SideBuilder {
   pos: number[] = []
   nrm: number[] = []
@@ -76,13 +64,18 @@ class SideBuilder {
     this.nrm.push(a.n.x, a.n.y, a.n.z, b.n.x, b.n.y, b.n.z, c.n.x, c.n.y, c.n.z)
   }
 
-  // Triângulo de tampa com uma única normal plana (flat shading no corte).
   pushCapTri(
-    a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3,
-    n: THREE.Vector3,
+    a: THREE.Vector3,
+    b: THREE.Vector3,
+    c: THREE.Vector3,
+    capN: THREE.Vector3,
   ): void {
     this.pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z)
-    this.nrm.push(n.x, n.y, n.z, n.x, n.y, n.z, n.x, n.y, n.z)
+    this.nrm.push(
+      capN.x, capN.y, capN.z,
+      capN.x, capN.y, capN.z,
+      capN.x, capN.y, capN.z,
+    )
   }
 
   toGeometry(): THREE.BufferGeometry {
@@ -95,7 +88,6 @@ class SideBuilder {
   }
 }
 
-/** Base ortonormal (u, v) do plano tal que u × v = n. */
 function planeBasis(n: THREE.Vector3): { u: THREE.Vector3; v: THREE.Vector3 } {
   const a =
     Math.abs(n.x) < 0.9
@@ -108,19 +100,14 @@ function planeBasis(n: THREE.Vector3): { u: THREE.Vector3; v: THREE.Vector3 } {
 
 function lerpVtx(a: Vtx, b: Vtx, t: number): Vtx {
   const p = new THREE.Vector3().lerpVectors(a.p, b.p, t)
-  const n = new THREE.Vector3().lerpVectors(a.n, b.n, t)
-  if (n.lengthSq() > 1e-12) n.normalize()
-  return { p, n }
+  const nm = new THREE.Vector3().lerpVectors(a.n, b.n, t)
+  if (nm.lengthSq() > 1e-12) nm.normalize()
+  return { p, n: nm }
 }
 
-/**
- * Executa o corte de sólido por plano.
- *
- * @param geometry   malha de entrada (indexada ou não).
- * @param planeNormal normal unitária do plano.
- * @param planePoint  um ponto pertencente ao plano.
- * @param eps         tolerância (fração do tamanho do modelo) para "sobre o plano".
- */
+// ---------------------------------------------------------------------------
+// Algoritmo principal
+// ---------------------------------------------------------------------------
 export function solidPlaneCut(
   geometry: THREE.BufferGeometry,
   planeNormal: THREE.Vector3,
@@ -134,7 +121,6 @@ export function solidPlaneCut(
   const idxAttr = geometry.index
   const triCount = idxAttr ? idxAttr.count / 3 : posAttr.count / 3
 
-  // Tolerância proporcional ao tamanho do modelo (robusto p/ qualquer escala).
   if (!geometry.boundingSphere) geometry.computeBoundingSphere()
   const scale = geometry.boundingSphere ? geometry.boundingSphere.radius : 1
   const EPS = eps ?? Math.max(1e-9, scale * 1e-6)
@@ -142,33 +128,31 @@ export function solidPlaneCut(
   const positive = new SideBuilder()
   const negative = new SideBuilder()
 
-  // Segmentos de interseção DIRECIONADOS (meia-aresta a→b) para reconstruir os
-  // loops de contorno de forma determinística. A direção é derivada do winding
-  // do triângulo (CCW no polígono recortado do lado negativo), o que torna a
-  // reconstrução robusta em seções não-manifold, detalhes finos e múltiplas
-  // ilhas — onde um grafo não-direcionado ramificaria errado.
-  const segDir: number[] = [] // por segmento: [ax,ay,az, bx,by,bz] com a→b
-  const idxA = idxAttr ? (idxAttr.array as ArrayLike<number>) : null
+  // Armazena segmentos de interseção como pares de pontos [ax,ay,az, bx,by,bz]
+  // com direção consistente: visto de +n, o material NEGATIVO fica à ESQUERDA.
+  const segFlat: number[] = []
 
-  // Helpers de leitura de vértice ------------------------------------------------
+  const idxA = idxAttr ? (idxAttr.array as ArrayLike<number>) : null
   const tmpFaceN = new THREE.Vector3()
   const va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3()
 
   const readVtx = (vi: number, faceN: THREE.Vector3): Vtx => {
     const p = new THREE.Vector3(posAttr.getX(vi), posAttr.getY(vi), posAttr.getZ(vi))
-    let nn: THREE.Vector3
+    let nm: THREE.Vector3
     if (nrmAttr) {
-      nn = new THREE.Vector3(nrmAttr.getX(vi), nrmAttr.getY(vi), nrmAttr.getZ(vi))
-      if (nn.lengthSq() < 1e-12) nn.copy(faceN)
+      nm = new THREE.Vector3(nrmAttr.getX(vi), nrmAttr.getY(vi), nrmAttr.getZ(vi))
+      if (nm.lengthSq() < 1e-12) nm.copy(faceN)
     } else {
-      nn = faceN.clone()
+      nm = faceN.clone()
     }
-    return { p, n: nn }
+    return { p, n: nm }
   }
 
-  // Loop principal: classifica + divide cada triângulo -------------------------
+  // ---------------------------------------------------------------------------
+  // PASSO 1-2: classifica e divide cada triângulo pelo plano
+  // ---------------------------------------------------------------------------
   for (let f = 0; f < triCount; f++) {
-    const i0 = idxA ? idxA[f * 3] : f * 3
+    const i0 = idxA ? idxA[f * 3]     : f * 3
     const i1 = idxA ? idxA[f * 3 + 1] : f * 3 + 1
     const i2 = idxA ? idxA[f * 3 + 2] : f * 3 + 2
 
@@ -176,115 +160,85 @@ export function solidPlaneCut(
     vb.set(posAttr.getX(i1), posAttr.getY(i1), posAttr.getZ(i1))
     vc.set(posAttr.getX(i2), posAttr.getY(i2), posAttr.getZ(i2))
 
-    // Normal geométrica da face (fallback quando não há atributo de normal).
-    tmpFaceN.crossVectors(
-      vb.clone().sub(va),
-      vc.clone().sub(va),
-    )
+    tmpFaceN.crossVectors(vb.clone().sub(va), vc.clone().sub(va))
     if (tmpFaceN.lengthSq() > 1e-20) tmpFaceN.normalize()
 
-    const V: Vtx[] = [readVtx(i0, tmpFaceN), readVtx(i1, tmpFaceN), readVtx(i2, tmpFaceN)]
+    const V: Vtx[] = [
+      readVtx(i0, tmpFaceN),
+      readVtx(i1, tmpFaceN),
+      readVtx(i2, tmpFaceN),
+    ]
 
-    // Distância com sinal ao plano: d = (p - planePoint) · n
     const d = [
       V[0].p.clone().sub(planePoint).dot(n),
       V[1].p.clone().sub(planePoint).dot(n),
       V[2].p.clone().sub(planePoint).dot(n),
     ]
 
+    // Classifica: snap vértices muito próximos do plano para cima/baixo
+    const side = d.map((di) =>
+      di > EPS ? 1 : di < -EPS ? -1 : 0,
+    )
+
     const dMin = Math.min(d[0], d[1], d[2])
     const dMax = Math.max(d[0], d[1], d[2])
 
-    // Triângulo inteiramente de um lado (ou coplanar) → vai inteiro.
+    // ── Triângulo inteiramente acima (ou coplanar) → lado positivo ──────────
     if (dMin >= -EPS) {
       positive.pushTri(V[0], V[1], V[2])
-      // Caso o plano passe por uma ARESTA inteira (2 vértices sobre o plano) e o
-      // terceiro esteja estritamente acima: essa aresta é parte do contorno do
-      // corte. Registra o segmento aqui (só pelo lado positivo p/ não duplicar,
-      // pois o triângulo vizinho fica inteiro do lado negativo).
+
+      // Aresta coplanar: dois vértices sobre o plano, terceiro acima.
+      // Segmento deve ser emitido com o lado NEGATIVO à ESQUERDA visto de +n.
+      // Como o winding do triângulo (CCW de +n) tem o positivo à esquerda,
+      // a aresta coplanar a→b no sentido CCW deixa o interior positivo à
+      // esquerda → inverte para b→a (negativo à esquerda).
       for (let i = 0; i < 3; i++) {
         const j = (i + 1) % 3
         const k = (i + 2) % 3
-        if (Math.abs(d[i]) <= EPS && Math.abs(d[j]) <= EPS && d[k] > EPS) {
-          // A aresta i→j está sobre o plano e é fronteira da tampa do lado
-          // negativo. Orienta de modo que o interior negativo (lado oposto ao
-          // vértice k, que está acima do plano) fique à esquerda quando visto
-          // de +n. Regra: se (n × e) apontar para longe de k, mantém i→j; senão
-          // inverte. Isso mantém o mesmo winding dos segmentos de straddle.
+        if (side[i] === 0 && side[j] === 0 && side[k] >= 0) {
           const a = V[i].p, b = V[j].p
-          const e = b.clone().sub(a)
-          const left = new THREE.Vector3().crossVectors(n, e) // "esquerda" vista de +n
-          const towardK = V[k].p.clone().sub(a)
-          if (left.dot(towardK) < 0) {
-            segDir.push(a.x, a.y, a.z, b.x, b.y, b.z)
-          } else {
-            segDir.push(b.x, b.y, b.z, a.x, a.y, a.z)
+          if (a.distanceToSquared(b) > EPS * EPS) {
+            // Inverte: emite b→a
+            segFlat.push(b.x, b.y, b.z, a.x, a.y, a.z)
           }
         }
       }
       continue
     }
+
+    // ── Triângulo inteiramente abaixo → lado negativo ──────────────────────
     if (dMax <= EPS) {
       negative.pushTri(V[0], V[1], V[2])
+
+      // Aresta coplanar com terceiro vértice abaixo: emite a→b direto
+      // (winding CCW de +n já coloca o negativo à esquerda pois o tri está abaixo)
+      for (let i = 0; i < 3; i++) {
+        const j = (i + 1) % 3
+        const k = (i + 2) % 3
+        if (side[i] === 0 && side[j] === 0 && side[k] <= 0) {
+          const a = V[i].p, b = V[j].p
+          if (a.distanceToSquared(b) > EPS * EPS) {
+            segFlat.push(a.x, a.y, a.z, b.x, b.y, b.z)
+          }
+        }
+      }
       continue
     }
 
-    // ── Straddle: o triângulo cruza o plano → clip Sutherland-Hodgman ─────────
-    const posPoly: Vtx[] = []
-    const negPoly: Vtx[] = []
-    // Marca, em paralelo a negPoly, quais vértices estão sobre o plano de corte.
-    const negOn: boolean[] = []
-
-    for (let i = 0; i < 3; i++) {
-      const j = (i + 1) % 3
-      const di = d[i], dj = d[j]
-      const vi = V[i], vj = V[j]
-
-      const iOn = Math.abs(di) <= EPS
-      if (di >= -EPS) posPoly.push(vi)
-      if (di <= EPS) { negPoly.push(vi); negOn.push(iOn) }
-
-      // Cruzamento estrito de sinal na aresta i→j → ponto de interseção.
-      if ((di > EPS && dj < -EPS) || (di < -EPS && dj > EPS)) {
-        const t = di / (di - dj)
-        const ip = lerpVtx(vi, vj, t)
-        posPoly.push(ip)
-        negPoly.push(ip)
-        negOn.push(true)
-      }
-    }
-
-    // Fan-triangula cada polígono do clip para o seu lado.
-    for (let i = 1; i + 1 < posPoly.length; i++) {
-      positive.pushTri(posPoly[0], posPoly[i], posPoly[i + 1])
-    }
-    for (let i = 1; i + 1 < negPoly.length; i++) {
-      negative.pushTri(negPoly[0], negPoly[i], negPoly[i + 1])
-    }
-
-    // Aresta de corte orientada = a aresta de negPoly (que é CCW no winding do
-    // triângulo) cujos DOIS extremos estão sobre o plano. Emitir essa aresta
-    // com direção preservada dá meia-arestas consistentes para montar os loops.
-    const m = negPoly.length
-    if (m >= 2) {
-      for (let k = 0; k < m; k++) {
-        const k2 = (k + 1) % m
-        if (negOn[k] && negOn[k2]) {
-          const a = negPoly[k].p, b = negPoly[k2].p
-          if (a.distanceToSquared(b) > EPS * EPS) {
-            segDir.push(a.x, a.y, a.z, b.x, b.y, b.z)
-          }
-          break
-        }
-      }
-    }
+    // ── Straddle: triângulo cruza o plano ──────────────────────────────────
+    // Usa clip explícito com rastreamento de quais vértices estão sobre o plano.
+    clipTriangle(V, d, side, EPS, positive, negative, segFlat)
   }
 
-  // ── Reconstrução dos loops de contorno fechados ─────────────────────────────
-  const { u, v } = planeBasis(n)
-  const loops = buildLoops(segDir, scale)
+  // ---------------------------------------------------------------------------
+  // PASSOS 3-4: reconstrói loops fechados a partir dos segmentos
+  // ---------------------------------------------------------------------------
+  const loops = buildLoops(segFlat, scale, EPS)
 
-  // ── Triangula os loops (tampas) com detecção de furos ───────────────────────
+  // ---------------------------------------------------------------------------
+  // PASSOS 5-7: triangula os loops e gera as tampas
+  // ---------------------------------------------------------------------------
+  const { u, v } = planeBasis(n)
   let capTriangles = 0
   if (loops.length > 0) {
     capTriangles = buildCaps(loops, n, u, v, planePoint, positive, negative)
@@ -298,19 +252,88 @@ export function solidPlaneCut(
   }
 }
 
-// ── Reconstrução de loops a partir de segmentos soltos ────────────────────────
+// ---------------------------------------------------------------------------
+// Clip de um triângulo que cruza o plano (Sutherland-Hodgman adaptado)
+// ---------------------------------------------------------------------------
+function clipTriangle(
+  V: Vtx[],
+  d: number[],
+  side: number[],
+  EPS: number,
+  positive: SideBuilder,
+  negative: SideBuilder,
+  segFlat: number[],
+): void {
+  // Polígonos resultantes do clip: cada vértice carrega se está sobre o plano.
+  const posPoly: Vtx[] = []
+  const negPoly: Vtx[] = []
+  const posOn: boolean[] = []
+  const negOn: boolean[] = []
+
+  for (let i = 0; i < 3; i++) {
+    const j = (i + 1) % 3
+    const di = d[i], dj = d[j]
+    const si = side[i], sj = side[j]
+    const vi = V[i], vj = V[j]
+
+    // Adiciona vértice atual ao lado correto
+    if (si >= 0) { posPoly.push(vi); posOn.push(si === 0) }
+    if (si <= 0) { negPoly.push(vi); negOn.push(si === 0) }
+
+    // Interseção estrita entre lados opostos (ignora vértices sobre o plano)
+    if ((si > 0 && sj < 0) || (si < 0 && sj > 0)) {
+      const t = di / (di - dj)
+      const ip = lerpVtx(vi, vj, t)
+      posPoly.push(ip); posOn.push(true)
+      negPoly.push(ip); negOn.push(true)
+    }
+  }
+
+  // Fan-triangula o polígono positivo
+  for (let i = 1; i + 1 < posPoly.length; i++) {
+    positive.pushTri(posPoly[0], posPoly[i], posPoly[i + 1])
+  }
+
+  // Fan-triangula o polígono negativo
+  for (let i = 1; i + 1 < negPoly.length; i++) {
+    negative.pushTri(negPoly[0], negPoly[i], negPoly[i + 1])
+  }
+
+  // Extrai o segmento de interseção: aresta de negPoly cujos dois extremos
+  // estão sobre o plano, percorrida no sentido CCW do polígono negativo.
+  // Isso garante que o material negativo fique à esquerda visto de +n.
+  const m = negPoly.length
+  for (let k = 0; k < m; k++) {
+    const k2 = (k + 1) % m
+    if (negOn[k] && negOn[k2]) {
+      const a = negPoly[k].p
+      const b = negPoly[k2].p
+      if (a.distanceToSquared(b) > EPS * EPS) {
+        segFlat.push(a.x, a.y, a.z, b.x, b.y, b.z)
+      }
+      // Continua procurando: pode haver múltiplos pares (ex.: um vértice está
+      // exatamente sobre o plano junto com um ponto de interseção).
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PASSO 3: reconstrói loops fechados a partir dos segmentos direcionados
+// ---------------------------------------------------------------------------
 interface Loop {
   pts: THREE.Vector3[]
 }
 
-function buildLoops(segFlat: number[], scale: number): Loop[] {
+function buildLoops(segFlat: number[], scale: number, EPS: number): Loop[] {
   const segCount = segFlat.length / 6
   if (segCount === 0) return []
 
-  // Solda pontos por posição quantizada → ids inteiros.
-  const Q = 1 / Math.max(scale * 1e-5, 1e-9)
+  // Solda pontos por posição quantizada para eliminar micro-gaps entre
+  // segmentos de triângulos adjacentes.
+  const Q = 1 / Math.max(scale * 1e-4, 1e-9)
   const keyToId = new Map<string, number>()
   const idPos: THREE.Vector3[] = []
+
   const idOf = (x: number, y: number, z: number): number => {
     const k = `${Math.round(x * Q)},${Math.round(y * Q)},${Math.round(z * Q)}`
     let id = keyToId.get(k)
@@ -322,81 +345,91 @@ function buildLoops(segFlat: number[], scale: number): Loop[] {
     return id
   }
 
-  // ── Grafo DIRECIONADO de meia-arestas (a → b) ───────────────────────────────
-  // Cada aresta de corte foi emitida com direção consistente (CCW no winding do
-  // triângulo do lado negativo). Percorrer o grafo respeitando essa direção
-  // garante loops fechados mesmo quando um vértice é compartilhado por mais de
-  // duas arestas (seções não-manifold, detalhes finos, ilhas múltiplas).
-  const outEdges = new Map<number, number[]>() // a → [b, b, ...]
+  // Constrói grafo direcionado a → [b1, b2, ...], removendo duplicatas.
+  // Duplicatas surgem quando dois triângulos compartilham a mesma aresta
+  // de corte (aresta interior da malha exatamente sobre o plano).
+  const outEdges = new Map<number, number[]>()
   const seen = new Set<string>()
 
   for (let s = 0; s < segCount; s++) {
     const o = s * 6
-    const a = idOf(segFlat[o], segFlat[o + 1], segFlat[o + 2])
+    const a = idOf(segFlat[o],     segFlat[o + 1], segFlat[o + 2])
     const b = idOf(segFlat[o + 3], segFlat[o + 4], segFlat[o + 5])
     if (a === b) continue
-    const dk = `${a}>${b}`
-    if (seen.has(dk)) continue // remove meia-arestas duplicadas exatas
-    seen.add(dk)
-    ;(outEdges.get(a) ?? outEdges.set(a, []).get(a)!).push(b)
+    const key = `${a}>${b}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    const list = outEdges.get(a)
+    if (list) {
+      list.push(b)
+    } else {
+      outEdges.set(a, [b])
+    }
   }
 
-  // Ponteiro de consumo por nó (quantas saídas já usamos) + total emitido.
-  const consumed = new Map<number, number>()
-  let totalEdges = 0
-  for (const list of outEdges.values()) totalEdges += list.length
+  // Chain following: percorre o grafo direcionado extraindo cadeias fechadas.
+  // Usa um mapa de "próximo ponteiro" por nó para consumir arestas sem repetir.
+  const nextPtr = new Map<number, number>()
 
   const loops: Loop[] = []
-  const maxGuard = totalEdges + 8
 
-  for (const [start, list] of outEdges) {
-    // Enquanto este nó tiver arestas de saída não consumidas, inicia um loop.
-    while ((consumed.get(start) ?? 0) < list.length) {
-      const loopIds: number[] = []
-      let cur = start
-      let guard = 0
+  for (const [startNode] of outEdges) {
+    // Enquanto este nó ainda tiver arestas não consumidas, inicia uma cadeia.
+    while (true) {
+      const ptr = nextPtr.get(startNode) ?? 0
+      const outs = outEdges.get(startNode)
+      if (!outs || ptr >= outs.length) break
+
+      // Percorre a cadeia até fechar o loop ou esgotar as saídas.
+      const chain: number[] = []
+      let cur = startNode
+      const maxSteps = idPos.length + 4
+      let steps = 0
       let closed = false
 
-      while (guard++ < maxGuard) {
-        const outs = outEdges.get(cur)
-        if (!outs) break
-        let ptr = consumed.get(cur) ?? 0
-        if (ptr >= outs.length) break // beco sem saída (não fecha)
+      while (steps++ < maxSteps) {
+        const curPtr = nextPtr.get(cur) ?? 0
+        const curOuts = outEdges.get(cur)
+        if (!curOuts || curPtr >= curOuts.length) break // sem saída disponível
 
-        loopIds.push(cur)
-        const next = outs[ptr]
-        consumed.set(cur, ptr + 1) // consome a meia-aresta cur→next
+        chain.push(cur)
+        const next = curOuts[curPtr]
+        nextPtr.set(cur, curPtr + 1) // consome a aresta cur→next
 
+        if (next === startNode) {
+          closed = true
+          break
+        }
         cur = next
-        if (cur === start) { closed = true; break }
       }
 
-      // Só aceita loops que voltaram ao início (fechados) com ≥ 3 vértices.
-      if (closed && loopIds.length >= 3) {
-        loops.push({ pts: loopIds.map((id) => idPos[id]) })
+      if (closed && chain.length >= 3) {
+        loops.push({ pts: chain.map((id) => idPos[id]) })
       }
-      // Se não fechou, as arestas já foram consumidas e são descartadas —
-      // evita loop infinito e não gera tampas com buraco.
+      // Se não fechou, as arestas foram consumidas igualmente — sem loop infinito.
     }
   }
 
   return loops
 }
 
-// ── Triangulação das tampas (com furos e concavidade) ─────────────────────────
+// ---------------------------------------------------------------------------
+// PASSOS 5-6: triangulação dos loops (tampas) com suporte a furos
+// ---------------------------------------------------------------------------
 interface Loop2D {
   pts3d: THREE.Vector3[]
   pts2d: THREE.Vector2[]
-  area: number // assinado no espaço (u, v)
+  area: number
 }
 
 function signedArea2D(pts: THREE.Vector2[]): number {
   let a = 0
-  for (let i = 0; i < pts.length; i++) {
-    const p = pts[i], q = pts[(i + 1) % pts.length]
+  const n = pts.length
+  for (let i = 0; i < n; i++) {
+    const p = pts[i], q = pts[(i + 1) % n]
     a += p.x * q.y - q.x * p.y
   }
-  return a / 2
+  return a * 0.5
 }
 
 function pointInPoly(pt: THREE.Vector2, poly: THREE.Vector2[]): boolean {
@@ -421,7 +454,7 @@ function buildCaps(
   positive: SideBuilder,
   negative: SideBuilder,
 ): number {
-  // Projeta cada loop para 2D (u, v).
+  // Projeta cada loop para o espaço 2D (u, v) do plano
   const L: Loop2D[] = loops.map((lp) => {
     const pts2d = lp.pts.map((p) => {
       const rel = p.clone().sub(planePoint)
@@ -430,20 +463,19 @@ function buildCaps(
     return { pts3d: lp.pts, pts2d, area: signedArea2D(pts2d) }
   })
 
-  // Classifica cada loop como contorno externo ou furo, via aninhamento.
-  // profundidade par → externo; ímpar → furo.
-  const depth: number[] = L.map((li, i) => {
+  // Determina profundidade de aninhamento: par = contorno externo, ímpar = furo
+  const depth = L.map((li, i) => {
     const rep = li.pts2d[0]
     let d = 0
     for (let j = 0; j < L.length; j++) {
       if (j === i) continue
+      // Só conta como pai loops de área maior
       if (Math.abs(L[j].area) <= Math.abs(li.area)) continue
       if (pointInPoly(rep, L[j].pts2d)) d++
     }
     return d
   })
 
-  // Associa cada furo ao menor contorno externo que o contém.
   const outers: number[] = []
   const holesOf = new Map<number, number[]>()
   L.forEach((_, i) => {
@@ -454,14 +486,18 @@ function buildCaps(
   })
   L.forEach((li, i) => {
     if (depth[i] % 2 === 1) {
-      // acha o outer que o contém com menor área
+      // Encontra o menor contorno externo que contém este furo
       let best = -1
       let bestArea = Infinity
       for (const oi of outers) {
-        if (Math.abs(L[oi].area) < Math.abs(li.area)) continue
-        if (pointInPoly(li.pts2d[0], L[oi].pts2d) && Math.abs(L[oi].area) < bestArea) {
+        const outerArea = Math.abs(L[oi].area)
+        if (outerArea < Math.abs(li.area)) continue
+        if (
+          pointInPoly(li.pts2d[0], L[oi].pts2d) &&
+          outerArea < bestArea
+        ) {
           best = oi
-          bestArea = Math.abs(L[oi].area)
+          bestArea = outerArea
         }
       }
       if (best >= 0) holesOf.get(best)!.push(i)
@@ -470,23 +506,25 @@ function buildCaps(
 
   let capTriangles = 0
 
-  const to3D = (p2: THREE.Vector2): THREE.Vector3 =>
-    planePoint.clone()
-      .add(u.clone().multiplyScalar(p2.x))
-      .add(v.clone().multiplyScalar(p2.y))
-
   for (const oi of outers) {
     const outer = L[oi]
     const holes = holesOf.get(oi)!.map((hi) => L[hi])
 
-    // Contorno externo deve ser CCW (área > 0); furos CW (área < 0).
-    const contour2d = outer.area >= 0 ? outer.pts2d.slice() : outer.pts2d.slice().reverse()
-    const contour3d = outer.area >= 0 ? outer.pts3d.slice() : outer.pts3d.slice().reverse()
+    // THREE.ShapeUtils.triangulateShape espera:
+    //   contorno externo: CCW → área > 0 em (u,v)
+    //   furos: CW → área < 0 em (u,v)
+    const contour2d = outer.area >= 0
+      ? outer.pts2d.slice()
+      : outer.pts2d.slice().reverse()
+    const contour3d = outer.area >= 0
+      ? outer.pts3d.slice()
+      : outer.pts3d.slice().reverse()
 
     const holes2d: THREE.Vector2[][] = []
     const holes3d: THREE.Vector3[][] = []
     for (const h of holes) {
-      if (h.area <= 0) {
+      // Furos devem ser CW (área < 0)
+      if (h.area < 0) {
         holes2d.push(h.pts2d.slice())
         holes3d.push(h.pts3d.slice())
       } else {
@@ -495,7 +533,8 @@ function buildCaps(
       }
     }
 
-    // Índices combinados [contour, ...holes] → posições 3D correspondentes.
+    // Constrói array combinado: [contorno, furo0, furo1, ...]
+    // Os índices retornados por triangulateShape indexam neste array combinado.
     const combined3d: THREE.Vector3[] = [...contour3d]
     for (const h3 of holes3d) combined3d.push(...h3)
 
@@ -503,9 +542,11 @@ function buildCaps(
     try {
       faces = THREE.ShapeUtils.triangulateShape(contour2d, holes2d)
     } catch {
-      // fallback: triangulação em leque do contorno externo
+      // Fallback: fan do contorno externo (funciona para convexos)
       faces = []
-      for (let i = 1; i + 1 < contour2d.length; i++) faces.push([0, i, i + 1])
+      for (let i = 1; i + 1 < contour2d.length; i++) {
+        faces.push([0, i, i + 1])
+      }
     }
 
     for (const tri of faces) {
@@ -514,12 +555,11 @@ function buildCaps(
       const C = combined3d[tri[2]]
       if (!A || !B || !C) continue
 
-      // Faces do triangulateShape são CCW em (u, v) → normal +n.
-      // Lado negativo (material em -n): tampa voltada para +n → usa como está.
+      // triangulateShape retorna winding CCW em (u,v) → normal aponta para +n.
+      // Tampa do lado NEGATIVO (material em -n): precisa de face voltada para +n → CCW está correto.
       negative.pushCapTri(A, B, C, n)
-      // Lado positivo (material em +n): tampa voltada para -n → inverte winding.
-      const nn = n.clone().negate()
-      positive.pushCapTri(A, C, B, nn)
+      // Tampa do lado POSITIVO (material em +n): precisa de face voltada para -n → inverte winding.
+      positive.pushCapTri(A, C, B, n.clone().negate())
       capTriangles += 2
     }
   }
